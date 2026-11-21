@@ -1,24 +1,517 @@
-# Compiled class file
-*.class
+package main;
 
-# Log file
-*.log
+import javax.swing.*;
+import java.awt.*;
+import java.awt.image.BufferedImage;
+import java.util.stream.IntStream;
+import static java.lang.Math.sqrt;
+import java.awt.event.*;
+import javax.imageio.ImageIO;
+import java.io.File;
 
-# BlueJ files
-*.ctxt
+public class Black_Hole {
+    static volatile boolean busy = false;
+    static volatile double roll = 0;
+    static int[] sky;
+    static int skyW, skyH;
+    static final double SENSITIVITY = 0.003;
+    public static void main(String[] args){
 
-# Mobile Tools for Java (J2ME)
-.mtj.tmp/
+        // JAVA BLACK HOLE
 
-# Package Files #
-*.jar
-*.war
-*.nar
-*.ear
-*.zip
-*.tar.gz
-*.rar
+        JFrame frame = new JFrame();
 
-# virtual machine crash logs, see http://www.java.com/en/download/help/error_hotspot.xml
-hs_err_pid*
-replay_pid*
+        loadSky("C:/Users/User/Pictures/background.jpg"); // add yo own picture for the background and change User for your folder
+
+        int width = 1200;
+        int height = 750;
+        BufferedImage image = new BufferedImage(width, height, BufferedImage.TYPE_INT_RGB);
+        BufferedImage preview = new BufferedImage(200, 125, BufferedImage.TYPE_INT_RGB);
+
+        double[] dist = {15};
+        double[] cam = {0, 0.12};
+        double[] spin = {0.4};
+
+        ImagePanel panel = new ImagePanel(image);
+        frame.add(panel);
+
+        frame.pack();
+        frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+        frame.setVisible(true);
+        panel.requestFocusInWindow();
+
+        busy = true;
+        new Thread(() -> {
+            render(preview, cam[0], cam[1], dist[0], spin[0], true);
+            panel.image = preview;
+            panel.repaint();
+
+            renderSharp(image, cam[0], cam[1], dist[0], spin[0]);
+            panel.image = image;
+            panel.repaint();
+            busy = false;
+        }).start();
+
+        int[] last = {0, 0};
+
+        MouseAdapter mouse = new MouseAdapter() {
+            @Override
+            public void mousePressed(MouseEvent e) {
+                last[0] = e.getX();
+                last[1] = e.getY();
+            }
+
+            @Override
+            public void mouseDragged(MouseEvent e) {
+                cam[0] += (e.getX() - last[0]) * SENSITIVITY;
+                cam[1] += (e.getY() - last[1]) * SENSITIVITY;
+                cam[1] = Math.max(-1.4, Math.min(1.4, cam[1]));
+                last[0] = e.getX();
+                last[1] = e.getY();
+
+                long t0 = System.nanoTime();
+                render(preview, cam[0], cam[1], dist[0], spin[0], true);
+                System.out.println((System.nanoTime() - t0) / 1_000_000 + " ms");
+
+                if (!busy) {
+                    busy = true;
+                    new Thread(() -> {
+                        render(preview, cam[0], cam[1], dist[0], spin[0], true);
+                        panel.image = preview;
+                        panel.repaint();
+                        busy = false;
+                    }).start();
+                }
+            }
+            @Override
+            public void mouseReleased(MouseEvent e) {
+                new Thread(() -> {
+                    while (busy) { Thread.onSpinWait(); }
+                    busy = true;
+                    renderSharp(image, cam[0], cam[1], dist[0], spin[0]);
+                    panel.image = image;
+                    panel.repaint();
+                    busy = false;
+                }).start();
+            }
+        };
+        panel.addMouseListener(mouse);
+        panel.addMouseMotionListener(mouse);
+
+        javax.swing.Timer sharpTimer = new javax.swing.Timer(300, ev -> {
+            new Thread(() -> {
+                while (busy) { Thread.onSpinWait(); }
+                busy = true;
+                renderSharp(image, cam[0], cam[1], dist[0], spin[0]);
+                panel.image = image;
+                panel.repaint();
+                busy = false;
+            }).start();
+        });
+        sharpTimer.setRepeats(false);
+
+        panel.addMouseWheelListener(e -> {
+            dist[0] *= Math.pow(1.1, e.getWheelRotation());
+            dist[0] = Math.max(6, Math.min(100, dist[0]));
+
+            if (!busy) {
+                busy = true;
+                new Thread(() -> {
+                    render(preview, cam[0], cam[1], dist[0], spin[0], true);
+                    panel.image = preview;
+                    panel.repaint();
+                    busy = false;
+                }).start();
+            }
+            sharpTimer.restart();
+        });
+
+        panel.setFocusable(true);
+        panel.addKeyListener(new KeyAdapter() {
+            @Override
+            public void keyPressed(KeyEvent e) {
+                if (e.getKeyCode() == KeyEvent.VK_UP) {
+                    spin[0] = Math.min(0.49, spin[0] + 0.05);
+                } else if (e.getKeyCode() == KeyEvent.VK_DOWN) {
+                    spin[0] = Math.max(0.0, spin[0] - 0.05);
+                } else if (e.getKeyCode() == KeyEvent.VK_LEFT) {
+                    roll -= 0.08;
+                } else if (e.getKeyCode() == KeyEvent.VK_RIGHT) {
+                    roll += 0.08;
+                } else if (e.getKeyCode() == KeyEvent.VK_R) {
+                    roll = 0;
+                    return;
+                }
+
+                if (!busy) {
+                    busy = true;
+                    new Thread(() -> {
+                        render(preview, cam[0], cam[1], dist[0], spin[0], true);
+                        panel.image = preview;
+                        panel.repaint();
+                        busy = false;
+                    }).start();
+                }
+                sharpTimer.restart();
+            }
+        });
+    }
+    static void render(BufferedImage image, double yaw, double pitch, double d, double spin, boolean fast) {
+        int width = image.getWidth();
+        int height = image.getHeight();
+
+        double aspect = (double) width / height;
+        double rs = 1;
+
+        double a = -spin;
+
+        double as = 2 * spin;
+        double z1c = 1 + Math.cbrt(1 - as*as) * (Math.cbrt(1 + as) + Math.cbrt(1 - as));
+        double z2c = Math.sqrt(3*as*as + z1c*z1c);
+        double rInner = 0.5 * (3 + z2c - Math.sqrt((3 - z1c) * (3 + z1c + 2*z2c)));
+
+        double cp = Math.cos(pitch), sp = Math.sin(pitch);
+        double cy = Math.cos(yaw),   sy = Math.sin(yaw);
+
+        double cosT = Math.cos(roll), sinT = Math.sin(roll);
+
+        double tanHalfFov = Math.tan(Math.toRadians(60) / 2);
+
+        double stepSize = fast ? 0.1 : 0.04;
+        int maxSteps = fast ? 500 : 1000;
+
+        double rPlus = 0.5 + Math.sqrt(0.25 - a * a);
+
+        IntStream.range(0, height).parallel().forEach(y -> {
+            for (int x = 0; x < width; x++) {
+
+                double u = (2.0 * (x + 0.5) / width - 1) * aspect * tanHalfFov;
+                double v = (1 - 2.0 * (y + 0.5) / height) * tanHalfFov;
+                double len = sqrt(u * u + v * v + 1);
+                double dx = u / len, dy = v / len, dz = 1 / len;
+
+                double px = 0, py = 0, pz = -d;
+                double vx = dx, vy = dy, vz = dz;
+
+                double y1 = py * cp - pz * sp;
+                double z1 = py * sp + pz * cp;
+                double nx = px * cy + z1 * sy;
+                double nz = -px * sy + z1 * cy;
+                px = nx; py = y1; pz = nz;
+
+                double wy1 = vy * cp - vz * sp;
+                double wz1 = vy * sp + vz * cp;
+                double wx = vx * cy + wz1 * sy;
+                double wz = -vx * sy + wz1 * cy;
+                vx = wx; vy = wy1; vz = wz;
+
+                double bx = px * cosT + py * sinT;
+                double by = -px * sinT + py * cosT;
+                px = bx; py = by;
+
+                double bvx = vx * cosT + vy * sinT;
+                double bvy = -vx * sinT + vy * cosT;
+                vx = bvx; vy = bvy;
+
+                double[] kf = new double[5];
+                kerrFields(px, py, pz, a, kf);
+
+                double H0 = kf[0];
+                double k0 = kf[1]*vx + kf[2]*vy + kf[3]*vz;
+                double mu = 1 / Math.sqrt(1 - H0 * (1 - k0*k0));
+                double q0 = (mu * k0 - 1) / (1 - H0);
+
+                double mx = mu*vx + H0*q0*kf[1];
+                double my = mu*vy + H0*q0*kf[2];
+                double mz = mu*vz + H0*q0*kf[3];
+
+                int color = 0;
+
+                double accR = 0, accG = 0, accB = 0;
+                double transmit = 1;
+
+                for (int step = 0; step < maxSteps; step++) {
+                    double rr = Math.sqrt(px * px + py * py + pz * pz);
+
+                    kerrFields(px, py, pz, a, kf);
+                    if (kf[4] < rPlus) break;
+
+                    if (rr > 40 && (px * vx + py * vy + pz * vz) > 0) {
+                        if (sky != null) {
+                            double sdx = vx * cosT - vy * sinT;
+                            double sdy = vx * sinT + vy * cosT;
+                            color = skyColor(sdx, sdy, vz);
+                            color = ((((color >> 16) & 255) / 4) << 16) | ((((color >> 8) & 255) / 4) << 8) | ((color & 255) / 4);
+                        } else {
+                            int n = 350;
+                            double h = hash((int) Math.floor(vx * n), (int) Math.floor(vy * n), (int) Math.floor(vz * n));
+                            if (h < 0.004) {
+                                double s = 0.35 + 0.65 * (h / 0.004);
+                                int c = (int) (s * 255);
+                                color = (c << 16) | (c << 8) | c;
+                            } else {
+                                color = (3 << 16) | (3 << 8) | 8;
+                            }
+                        }
+                        break;
+                    }
+
+                    double dt = Math.min(stepSize * Math.max(0.25, rr - 0.6 * rPlus), 1.0);
+                    double eps = 1e-4;
+
+                    double gx = (kerrG(px + eps, py, pz, mx, my, mz, a) - kerrG(px - eps, py, pz, mx, my, mz, a)) / (2 * eps);
+                    double gy = (kerrG(px, py + eps, pz, mx, my, mz, a) - kerrG(px, py - eps, pz, mx, my, mz, a)) / (2 * eps);
+                    double gz = (kerrG(px, py, pz + eps, mx, my, mz, a) - kerrG(px, py, pz - eps, mx, my, mz, a)) / (2 * eps);
+                    mx += 0.5 * gx * dt;
+                    my += 0.5 * gy * dt;
+                    mz += 0.5 * gz * dt;
+
+                    double q = kf[1] * mx + kf[2] * my + kf[3] * mz - 1;
+                    double kx = mx - kf[0] * q * kf[1];
+                    double ky = my - kf[0] * q * kf[2];
+                    double kz = mz - kf[0] * q * kf[3];
+
+                    double oldS = py;
+                    double ox = px, oy = py, oz = pz;
+
+                    px += kx * dt;
+                    py += ky * dt;
+                    pz += kz * dt;
+
+                    double kl = Math.sqrt(kx * kx + ky * ky + kz * kz);
+                    vx = kx / kl;
+                    vy = ky / kl;
+                    vz = kz / kl;
+
+                    double newS = py;
+
+
+                    if (oldS * newS < 0) {
+                        double f = oldS / (oldS - newS);
+                        double hx = ox + f * (px - ox);
+                        double hy = oy + f * (py - oy);
+                        double hz = oz + f * (pz - oz);
+                        double rd = Math.sqrt(hx * hx + hy * hy + hz * hz);
+
+                        if (rd > rInner && rd < 9 * rs) {
+                            double tx = hz / rd;
+                            double ty = 0;
+                            double tz = -hx / rd;
+
+                            double beta = Math.min(0.9, Math.sqrt(0.5 * rs / rd));
+                            double gamma = 1 / Math.sqrt(1 - beta * beta);
+                            double along = beta * (tx * vx + ty * vy + tz * vz);
+                            double doppler = 1 / (gamma * (1 + along));
+
+                            double grav = Math.sqrt(Math.max(0.01, 1 - rs / rd));
+
+                            double t = (9 * rs - rd) / (9 * rs - rInner);
+                            double bright = Math.pow(t, 1.5) * 3;
+
+                            double w = 1.2 * Math.log(rd);
+                            double cw = Math.cos(w), sw = Math.sin(w);
+                            double sx = (hx * cw - hz * sw) * 1.5;
+                            double sz = (hx * sw + hz * cw) * 1.5;
+                            double turb = 0.6 * noise(sx, sz) + 0.3 * noise(sx * 2, sz * 2) + 0.1 * noise(sx * 4, sz * 4);
+                            bright = bright * (0.45 + 1.1 * turb);
+
+                            double dopplerStrength = 0.4;
+                            bright = bright * Math.pow(doppler, dopplerStrength) * Math.pow(grav, 3);
+
+                            double dr = Math.min(1, bright);
+                            double dg = Math.min(1, bright * (0.5 + 0.5 * t));
+                            double db = Math.min(1, bright * (0.2 + 0.8 * t * t));
+
+                            double fadeOut = Math.min(1, (9 * rs - rd) / 3.0);
+                            double fadeIn  = Math.min(1, (rd - rInner) / 0.3);
+                            double alpha = Math.min(0.95, bright) * fadeIn * fadeOut;
+
+                            accR += transmit * dr * 255 * fadeOut;
+                            accG += transmit * dg * 255 * fadeOut;
+                            accB += transmit * db * 255 * fadeOut;
+                            transmit *= (1 - alpha);
+
+                            if (transmit < 0.02) break;
+                        }
+                    }
+                }
+                int cr = (int) Math.min(255, accR + transmit * ((color >> 16) & 255));
+                int cg = (int) Math.min(255, accG + transmit * ((color >> 8) & 255));
+                int cb = (int) Math.min(255, accB + transmit * (color & 255));
+                color = (cr << 16) | (cg << 8) | cb;
+                image.setRGB(x, y, color);
+            }
+        });
+    }
+    static double hash(int a, int b, int c) {
+        int h = a * 73856093 ^ b * 19349663 ^ c * 83492791;
+        h ^= h >>> 13;
+        h *= 0x5bd1e995;
+        h ^= h >>> 15;
+        return (h & 0xFFFFFF) / (double) 0x1000000;
+    }
+    static void renderSharp(BufferedImage out, double yaw, double pitch, double d, double spin) {
+        int w = out.getWidth(), h = out.getHeight();
+        BufferedImage big = new BufferedImage(w * 2, h * 2, BufferedImage.TYPE_INT_RGB);
+        render(big, yaw, pitch, d, spin, false);
+
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int r = 0, g = 0, b = 0;
+                for (int j = 0; j < 2; j++) {
+                    for (int i = 0; i < 2; i++) {
+                        int c = big.getRGB(2 * x + i, 2 * y + j);
+                        r += (c >> 16) & 255;
+                        g += (c >> 8) & 255;
+                        b += c & 255;
+                    }
+                }
+                out.setRGB(x, y, ((r / 4) << 16) | ((g / 4) << 8) | (b / 4));
+            }
+        }
+        bloom(out);
+    }
+    static float[] boxBlur(float[] s, int w, int h, int r, boolean horiz) {
+        float[] o = new float[w * h];
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                float sum = 0;
+                for (int k = -r; k <= r; k++) {
+                    int xx = horiz ? x + k : x;
+                    int yy = horiz ? y : y + k;
+                    if (xx < 0 || xx >= w || yy < 0 || yy >= h) continue;
+                    sum += s[yy * w + xx];
+                }
+                o[y * w + x] = sum / (2 * r + 1);
+            }
+        }
+        return o;
+    }
+
+    static void bloom(BufferedImage img) {
+        int w = img.getWidth(), h = img.getHeight();
+        int[] px = img.getRGB(0, 0, w, h, null, 0, w);
+
+        float[][] ch = new float[3][w * h];
+        for (int i = 0; i < w * h; i++) {
+            ch[0][i] = Math.max(0, ((px[i] >> 16) & 255) - 170);
+            ch[1][i] = Math.max(0, ((px[i] >> 8) & 255) - 170);
+            ch[2][i] = Math.max(0, (px[i] & 255) - 170);
+        }
+
+        int radius = 10;
+        for (int c = 0; c < 3; c++) {
+            for (int pass = 0; pass < 2; pass++) {
+                ch[c] = boxBlur(ch[c], w, h, radius, true);
+                ch[c] = boxBlur(ch[c], w, h, radius, false);
+            }
+        }
+
+        double gain = 3.0;
+        for (int i = 0; i < w * h; i++) {
+            int r = (int) Math.min(255, ((px[i] >> 16) & 255) + gain * ch[0][i]);
+            int g = (int) Math.min(255, ((px[i] >> 8) & 255) + gain * ch[1][i]);
+            int b = (int) Math.min(255, (px[i] & 255) + gain * ch[2][i]);
+            img.setRGB(i % w, i / w, (r << 16) | (g << 8) | b);
+        }
+    }
+    static double noise(double x, double y) {
+        int xi = (int) Math.floor(x), yi = (int) Math.floor(y);
+        double fx = x - xi, fy = y - yi;
+        fx = fx * fx * (3 - 2 * fx);
+        fy = fy * fy * (3 - 2 * fy);
+
+        double a = hash(xi,     yi,     7);
+        double b = hash(xi + 1, yi,     7);
+        double c = hash(xi,     yi + 1, 7);
+        double d = hash(xi + 1, yi + 1, 7);
+
+        return a * (1 - fx) * (1 - fy) + b * fx * (1 - fy) + c * (1 - fx) * fy + d * fx * fy;
+    }
+    static int skyColor(double vx, double vy, double vz) {
+        double len = Math.sqrt(vx * vx + vy * vy + vz * vz);
+        double lon = Math.atan2(vx, vz);
+        double lat = Math.asin(vy / len);
+
+        double fx = (lon / (2 * Math.PI) + 0.5) * skyW - 0.5;
+        double fy = (0.5 - lat / Math.PI) * skyH - 0.5;
+
+        int x0 = (int) Math.floor(fx);
+        int y0 = (int) Math.floor(fy);
+        double tx = fx - x0;
+        double ty = fy - y0;
+
+        int xa = ((x0 % skyW) + skyW) % skyW;
+        int xb = (xa + 1) % skyW;
+        int ya = Math.max(0, Math.min(skyH - 1, y0));
+        int yb = Math.max(0, Math.min(skyH - 1, y0 + 1));
+
+        int c00 = sky[ya * skyW + xa], c10 = sky[ya * skyW + xb];
+        int c01 = sky[yb * skyW + xa], c11 = sky[yb * skyW + xb];
+
+        int result = 0;
+        for (int shift = 16; shift >= 0; shift -= 8) {
+            double top = ((c00 >> shift) & 255) * (1 - tx) + ((c10 >> shift) & 255) * tx;
+            double bot = ((c01 >> shift) & 255) * (1 - tx) + ((c11 >> shift) & 255) * tx;
+            int value = (int) (top * (1 - ty) + bot * ty + 0.5);
+            result |= Math.min(255, value) << shift;
+        }
+        return result;
+    }
+    static double kerrG(double x, double y, double z,
+                        double px, double py, double pz, double a) {
+        double a2 = a * a;
+        double t = x*x + y*y + z*z - a2;
+        double r2 = 0.5 * (t + Math.sqrt(t*t + 4*a2*y*y));
+        double r = Math.sqrt(r2);
+        double den = r2 + a2;
+
+        double H  = r * r2 / (r2*r2 + a2*y*y);
+        double lx = -(r*x - a*z) / den;
+        double ly = -y / r;
+        double lz = -(r*z + a*x) / den;
+
+        double q = lx*px + ly*py + lz*pz - 1;
+        return H * q * q;
+    }
+    static void kerrFields(double x, double y, double z, double a, double[] out) {
+        double a2 = a * a;
+        double t = x*x + y*y + z*z - a2;
+        double r2 = 0.5 * (t + Math.sqrt(t*t + 4*a2*y*y));
+        double r = Math.sqrt(r2);
+        double den = r2 + a2;
+        out[0] = r * r2 / (r2*r2 + a2*y*y);
+        out[1] = -(r*x - a*z) / den;
+        out[2] = -y / r;
+        out[3] = -(r*z + a*x) / den;
+        out[4] = r;
+
+    }
+    static void loadSky(String path) {
+        try {
+            BufferedImage img = ImageIO.read(new File(path));
+            skyW = img.getWidth();
+            skyH = img.getHeight();
+            sky = img.getRGB(0, 0, skyW, skyH, null, 0, skyW);
+        } catch (Exception ex) {
+            System.out.println("Could not load star map: " + ex.getMessage());
+            sky = null;
+        }
+    }
+}
+class ImagePanel extends JPanel {
+    volatile BufferedImage image;;
+
+    ImagePanel(BufferedImage image) {
+        this.image = image;
+        setPreferredSize(new Dimension(image.getWidth(), image.getHeight()));
+    }
+
+    @Override
+    protected void paintComponent(Graphics g) {
+        super.paintComponent(g);
+        g.drawImage(image, 0, 0, getWidth(), getHeight(), null);
+    }
+
+}
+
