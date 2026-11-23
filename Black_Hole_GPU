@@ -1,0 +1,486 @@
+import org.lwjgl.glfw.*;
+import org.lwjgl.opengl.*;
+import static org.lwjgl.glfw.GLFW.*;
+import static org.lwjgl.opengl.GL11.*;
+import static org.lwjgl.opengl.GL20.*;
+import static org.lwjgl.opengl.GL30.*;
+import static org.lwjgl.system.MemoryUtil.NULL;
+import org.lwjgl.stb.STBImage;
+import org.lwjgl.system.MemoryStack;
+import java.nio.ByteBuffer;
+import java.nio.IntBuffer;
+
+public class Main {
+    static double yaw = 0, pitch = 0.12, dist = 15;
+    static double spin = 0.0;
+    static double tilt = 0.0;
+    static double skyGain = 0.25;
+    static double lastX, lastY;
+    static boolean dragging = false;
+
+    public static void main(String[] args) {
+
+        if (!glfwInit()) throw new IllegalStateException("GLFW failed to start");
+
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+        glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+
+        long window = glfwCreateWindow(1200, 750, "Black Hole GPU", NULL, NULL);
+        if (window == NULL) throw new RuntimeException("Could not create the window");
+
+        glfwMakeContextCurrent(window);
+        glfwSwapInterval(1);
+        GL.createCapabilities();
+
+        glfwSetMouseButtonCallback(window, (win, button, action, mods) -> {
+            if (button == GLFW_MOUSE_BUTTON_LEFT) {
+                dragging = (action == GLFW_PRESS);
+                double[] cx = new double[1], cy = new double[1];
+                glfwGetCursorPos(win, cx, cy);
+                lastX = cx[0];
+                lastY = cy[0];
+            }
+        });
+
+        glfwSetCursorPosCallback(window, (win, x, y) -> {
+            if (dragging) {
+                yaw += (x - lastX) * 0.003;
+                pitch += (y - lastY) * 0.003;
+                pitch = Math.max(-1.4, Math.min(1.4, pitch));
+
+            }
+            lastX = x;
+            lastY = y;
+        });
+        glfwSetKeyCallback(window, (win, key, scancode, action, mods) -> {
+            if (action == GLFW_PRESS || action == GLFW_REPEAT) {
+                if (key == GLFW_KEY_UP) spin = Math.min(0.49, spin + 0.05);
+                if (key == GLFW_KEY_DOWN) spin = Math.max(0.0, spin - 0.05);
+                if (key == GLFW_KEY_LEFT) tilt -= 0.08;
+                if (key == GLFW_KEY_RIGHT) tilt += 0.08;
+                if (key == GLFW_KEY_RIGHT) tilt += 0.08;
+                if (key == GLFW_KEY_LEFT_BRACKET)  skyGain = Math.max(0.0, skyGain * 0.8);
+                if (key == GLFW_KEY_RIGHT_BRACKET) skyGain = Math.min(2.0, Math.max(0.02, skyGain) * 1.25);
+            }
+        });
+
+        glfwSetScrollCallback(window, (win, dx, dy) -> {
+            dist *= Math.pow(1.1, -dy);
+            dist = Math.max(6, Math.min(100, dist));
+        });
+
+        String vertexSrc = """
+                #version 330 core
+                void main() {
+                    vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+                    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);}
+                """;
+
+        String fragmentSrc = """
+                                #version 330 core
+                                uniform vec2 uRes;
+                                uniform float uYaw;
+                                uniform float uPitch;
+                                uniform float uDist;
+                                uniform float uSpin;
+                                uniform float uTilt;
+                                uniform float uSkyGain;
+                
+                                uniform sampler2D uSky;
+                                const float PI = 3.14159265;
+                                out vec4 fragColor;
+                
+                    vec3 rotateCam(vec3 a, float pitch, float yaw) {
+                        float cp = cos(pitch), sp = sin(pitch);
+                        float cy = cos(yaw),   sy = sin(yaw);
+                        float y1 = a.y * cp - a.z * sp;
+                        float z1 = a.y * sp + a.z * cp;
+                        return vec3(a.x * cy + z1 * sy, y1, -a.x * sy + z1 * cy);
+                    }
+                                float hash21(vec2 p) {
+                                                p = fract(p * vec2(123.34, 456.21));
+                                                p += dot(p, p + 45.32);
+                                                return fract(p.x * p.y);
+                                            }
+                
+                                            float noise(vec2 p) {
+                                                vec2 i = floor(p);
+                                                vec2 f = fract(p);
+                                                f = f * f * (3.0 - 2.0 * f);
+                
+                                                float a = hash21(i);
+                                                float b = hash21(i + vec2(1.0, 0.0));
+                                                float c = hash21(i + vec2(0.0, 1.0));
+                                                float d = hash21(i + vec2(1.0, 1.0));
+                
+                                                return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+                                            }
+                                            struct KF { float H; vec3 l; float r; };
+                
+                                                        KF kerrFields(vec3 p, float a) {
+                                                            float a2 = a * a;
+                                                            float t = dot(p, p) - a2;
+                                                            float r2 = 0.5 * (t + sqrt(t * t + 4.0 * a2 * p.y * p.y));
+                                                            float r = sqrt(r2);
+                                                            float den = r2 + a2;
+                
+                                                            KF k;
+                                                            k.H = r * r2 / (r2 * r2 + a2 * p.y * p.y);
+                                                            k.l = vec3(-(r * p.x - a * p.z) / den, -p.y / r, -(r * p.z + a * p.x) / den);
+                                                            k.r = r;
+                                                            return k;
+                                                        }
+                
+                                                        float kerrG(vec3 x, vec3 m, float a) {
+                                                            KF k = kerrFields(x, a);
+                                                            float q = dot(k.l, m) - 1.0;
+                                                            return k.H * q * q;
+                                                        }
+                
+                                                        vec3 kerrGrad(vec3 x, vec3 m, float a) {
+                                                            float e = 1e-3;
+                                                            float gx = (kerrG(x + vec3(e, 0.0, 0.0), m, a) - kerrG(x - vec3(e, 0.0, 0.0), m, a)) / (2.0 * e);
+                                                            float gy = (kerrG(x + vec3(0.0, e, 0.0), m, a) - kerrG(x - vec3(0.0, e, 0.0), m, a)) / (2.0 * e);
+                                                            float gz = (kerrG(x + vec3(0.0, 0.0, e), m, a) - kerrG(x - vec3(0.0, 0.0, e), m, a)) / (2.0 * e);
+                                                            return vec3(gx, gy, gz);
+                                                        }
+                
+                vec3 trace(vec2 fc) {
+                        float aspect = uRes.x / uRes.y;
+                        float tanHalfFov = tan(radians(60.0) / 2.0);
+                
+                        vec2 p = 2.0 * fc / uRes - 1.0;
+                        float u = p.x * aspect * tanHalfFov;
+                        float v = p.y * tanHalfFov;
+                
+                        vec3 dir = normalize(vec3(u, v, 1.0));
+                        vec3 pos = vec3(0.0, 0.0, -uDist);
+                
+                        dir = rotateCam(dir, uPitch, uYaw);
+                        pos = rotateCam(pos, uPitch, uYaw);
+                
+                                    float cT = cos(uTilt), sT = sin(uTilt);
+                                    pos = vec3(pos.x * cT + pos.y * sT, -pos.x * sT + pos.y * cT, pos.z);
+                                    dir = vec3(dir.x * cT + dir.y * sT, -dir.x * sT + dir.y * cT, dir.z);
+                
+                      float rs = 1.0;
+                                  float rOuter = 9.0;
+                
+                                 float a = -uSpin;
+                                             float rPlus = 0.5 + sqrt(0.25 - a * a);
+                
+                                             float sa = 2.0 * uSpin;
+                                             float z1c = 1.0 + pow(1.0 - sa * sa, 1.0 / 3.0) * (pow(1.0 + sa, 1.0 / 3.0) + pow(1.0 - sa, 1.0 / 3.0));
+                                             float z2c = sqrt(3.0 * sa * sa + z1c * z1c);
+                                             float rInner = 0.5 * (3.0 + z2c - sqrt((3.0 - z1c) * (3.0 + z1c + 2.0 * z2c)));
+                
+                                             KF k0 = kerrFields(pos, a);
+                                             float kk = dot(k0.l, dir);
+                                             float mu = 1.0 / sqrt(1.0 - k0.H * (1.0 - kk * kk));
+                                             float q0 = (mu * kk - 1.0) / (1.0 - k0.H);
+                                             vec3 m = mu * dir + k0.H * q0 * k0.l;
+                
+                                  vec3 color = vec3(0.0);
+                                  vec3 acc = vec3(0.0);
+                                  float transmit = 1.0;
+                
+                                  for (int i = 0; i < 2000; i++) {
+                                      float r = length(pos);
+                
+                                     KF k = kerrFields(pos, a);
+                                                 if (k.r < rPlus) break;
+                
+                                      if (r > 40.0 && dot(pos, dir) > 0.0) {
+                                          vec3 d0 = normalize(dir);
+                                                      vec3 d = vec3(d0.x * cT - d0.y * sT, d0.x * sT + d0.y * cT, d0.z);
+                                          float lon = atan(d.x, d.z);
+                                          float lat = asin(clamp(d.y, -1.0, 1.0));
+                                          vec2 st = vec2(lon / (2.0 * PI) + 0.5, 0.5 - lat / PI);
+                                          color = texture(uSky, st).rgb * uSkyGain;
+                                          break;
+                                      }
+                
+                                     float dt = min(0.04 * max(0.25, r - 0.6 * rPlus), 1.0);
+                
+                                                m += 0.5 * kerrGrad(pos, m, a) * dt;                 // kick
+                
+                                                            float q = dot(k.l, m) - 1.0;
+                                                            vec3 kv = m - k.H * q * k.l;
+                
+                                                            vec3 prev = pos;
+                                                            pos += kv * dt;
+                                                            dir = normalize(kv);
+                
+                
+                                                  if (prev.y * pos.y < 0.0) {
+                                                      float f = prev.y / (prev.y - pos.y);
+                                                      vec3 hit = prev + f * (pos - prev);
+                                                      float rd = length(hit);
+                
+                                                      if (rd > rInner && rd < rOuter) {
+                                                          vec3 dn = normalize(dir);
+                
+                                                          vec3 tangent = vec3(hit.z, 0.0, -hit.x) / rd;
+                                                          float beta = min(0.9, sqrt(0.5 * rs / rd));
+                                                          float gamma = 1.0 / sqrt(1.0 - beta * beta);
+                                                          float doppler = 1.0 / (gamma * (1.0 + beta * dot(tangent, dn)));
+                                                          float grav = sqrt(max(0.01, 1.0 - rs / rd));
+                
+                                                          float t = (rOuter - rd) / (rOuter - rInner);
+                                                          float bright = pow(t, 1.5) * 3.0;
+                
+                                                          float w = 1.2 * log(rd);
+                                                          float cw = cos(w), sw = sin(w);
+                                                          vec2 sq = vec2(hit.x * cw - hit.z * sw, hit.x * sw + hit.z * cw) * 1.5;
+                                                          float turb = 0.6 * noise(sq) + 0.3 * noise(sq * 2.0) + 0.1 * noise(sq * 4.0);
+                                                          bright *= 0.45 + 1.1 * turb;
+                
+                                                          bright *= pow(doppler, 0.4) * pow(grav, 3.0);
+                
+                                                          vec3 glow = min(vec3(1.0), bright * vec3(1.0, 0.5 + 0.5 * t, 0.2 + 0.8 * t * t));
+                
+                                                          float fadeOut = min(1.0, (rOuter - rd) / 3.0);
+                                                          float fadeIn = min(1.0, (rd - rInner) / 0.3);
+                                                          float alpha = min(0.95, bright) * fadeIn * fadeOut;
+                
+                                                          acc += transmit * glow * fadeOut;
+                                                          transmit *= (1.0 - alpha);
+                
+                                                          if (transmit < 0.02) break;
+                                                      }
+                                     }
+                                 }
+                                  return acc + transmit * color;
+                    }
+                    void main() {
+                                        vec3 sum = vec3(0.0);
+                                        for (int j = 0; j < 2; j++) {
+                                            for (int i = 0; i < 2; i++) {
+                                                vec2 offset = vec2(float(i) - 0.5, float(j) - 0.5) * 0.5;     // -0.25 or +0.25 of a pixel
+                                                sum += trace(gl_FragCoord.xy + offset);
+                                            }
+                                        }
+                                        fragColor = vec4(sum / 4.0, 1.0);
+                                    }
+                """;
+
+        int program = makeProgram(vertexSrc, fragmentSrc);
+
+        String blurSrc = """
+                #version 330 core
+                uniform sampler2D uTex;
+                uniform vec2 uInvTarget;
+                uniform vec2 uStep;
+                uniform float uThreshold;
+                out vec4 fragColor;
+                
+                vec3 tap(vec2 uv) {
+                    return max(texture(uTex, uv).rgb - vec3(uThreshold), vec3(0.0));
+                }
+                
+                void main() {
+                    vec2 uv = gl_FragCoord.xy * uInvTarget;
+                    vec3 sum = tap(uv) * 0.2270270270;
+                    sum += (tap(uv + uStep)       + tap(uv - uStep))       * 0.1945945946;
+                    sum += (tap(uv + 2.0 * uStep) + tap(uv - 2.0 * uStep)) * 0.1216216216;
+                    sum += (tap(uv + 3.0 * uStep) + tap(uv - 3.0 * uStep)) * 0.0540540541;
+                    sum += (tap(uv + 4.0 * uStep) + tap(uv - 4.0 * uStep)) * 0.0162162162;
+                    fragColor = vec4(sum, 1.0);
+                }
+                """;
+
+        String compositeSrc = """
+                #version 330 core
+                uniform sampler2D uScene;
+                uniform sampler2D uBloom;
+                uniform vec2 uRes;
+                uniform float uGain;
+                out vec4 fragColor;
+                
+                void main() {
+                    vec2 uv = gl_FragCoord.xy / uRes;
+                    vec3 c = texture(uScene, uv).rgb + uGain * texture(uBloom, uv).rgb;
+                    fragColor = vec4(min(c, vec3(1.0)), 1.0);
+                }
+                """;
+
+        int blurProgram = makeProgram(vertexSrc, blurSrc);
+        int uBlurTex = glGetUniformLocation(blurProgram, "uTex");
+        int uBlurInvTarget = glGetUniformLocation(blurProgram, "uInvTarget");
+        int uBlurStep = glGetUniformLocation(blurProgram, "uStep");
+        int uBlurThreshold = glGetUniformLocation(blurProgram, "uThreshold");
+
+        int compositeProgram = makeProgram(vertexSrc, compositeSrc);
+        int uCompScene = glGetUniformLocation(compositeProgram, "uScene");
+        int uCompBloom = glGetUniformLocation(compositeProgram, "uBloom");
+        int uCompRes = glGetUniformLocation(compositeProgram, "uRes");
+        int uCompGain = glGetUniformLocation(compositeProgram, "uGain");
+
+        int[] fbSize0 = new int[2], fbSize1 = new int[2];
+        glfwGetFramebufferSize(window, fbSize0, fbSize1);
+        int W = fbSize0[0], H = fbSize1[0];
+        int[] scene = makeTarget(W, H);
+
+        int hw = W / 2, hh = H / 2;
+        int[] bloomA = makeTarget(hw, hh);
+        int[] bloomB = makeTarget(hw, hh);
+
+        int vao = glGenVertexArrays();
+        int uRes = glGetUniformLocation(program, "uRes");
+
+        int uYaw = glGetUniformLocation(program, "uYaw");
+        int uPitch = glGetUniformLocation(program, "uPitch");
+        int uDist = glGetUniformLocation(program, "uDist");
+        int uSpin = glGetUniformLocation(program, "uSpin");
+        int uTilt = glGetUniformLocation(program, "uTilt");
+        int uSkyGain = glGetUniformLocation(program, "uSkyGain");
+
+        int skyTex = loadTexture("C:/Users/temir/Pictures/stars.jpg");
+        int uSky = glGetUniformLocation(program, "uSky");
+
+        while (!glfwWindowShouldClose(window)) {
+            int[] w = new int[1], h = new int[1];
+            glfwGetFramebufferSize(window, w, h);
+
+            if (w[0] == 0 || h[0] == 0) {
+                glfwPollEvents();
+                continue;
+            }
+
+            if (w[0] != W || h[0] != H) {
+                freeTarget(scene);
+                freeTarget(bloomA);
+                freeTarget(bloomB);
+
+                W = w[0];
+                H = h[0];
+                hw = W / 2;
+                hh = H / 2;
+
+                scene  = makeTarget(W, H);
+                bloomA = makeTarget(hw, hh);
+                bloomB = makeTarget(hw, hh);
+            }
+
+            glBindFramebuffer(GL_FRAMEBUFFER, scene[0]);
+            glViewport(0, 0, W, H);
+
+            glUseProgram(program);
+            glUniform2f(uRes, W, H);
+            glUniform1f(uYaw, (float) yaw);
+            glUniform1f(uPitch, (float) pitch);
+            glUniform1f(uDist, (float) dist);
+            glUniform1f(uSpin, (float) spin);
+            glUniform1f(uTilt, (float) tilt);
+            glUniform1f(uSkyGain, (float) skyGain);
+
+            glBindTexture(GL_TEXTURE_2D, skyTex);
+            glUniform1i(uSky, 0);
+
+            glBindVertexArray(vao);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+
+            float spread = 2.0f;
+
+
+            glBindFramebuffer(GL_FRAMEBUFFER, bloomB[0]);
+            glViewport(0, 0, hw, hh);
+            glUseProgram(blurProgram);
+            glUniform2f(uBlurInvTarget, 1f / hw, 1f / hh);
+            glUniform2f(uBlurStep, spread / hw, 0f);
+            glUniform1f(uBlurThreshold, 0.6f);
+            glBindTexture(GL_TEXTURE_2D, scene[1]);
+            glUniform1i(uBlurTex, 0);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+
+            // pass 3: blur vertically  (bloomB -> bloomA)
+            glBindFramebuffer(GL_FRAMEBUFFER, bloomA[0]);
+            glUniform2f(uBlurStep, 0f, spread / hh);
+            glUniform1f(uBlurThreshold, 0f);
+            glBindTexture(GL_TEXTURE_2D, bloomB[1]);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            glViewport(0, 0, w[0], h[0]);
+            glUseProgram(compositeProgram);
+            glUniform2f(uCompRes, w[0], h[0]);
+            glUniform1f(uCompGain, 2.0f);
+
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, scene[1]);
+            glUniform1i(uCompScene, 0);
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, bloomA[1]);
+            glUniform1i(uCompBloom, 1);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+            glActiveTexture(GL_TEXTURE0);
+
+            glfwSwapBuffers(window);
+            glfwPollEvents();
+        }
+        glfwTerminate();
+    }
+
+    static int compile ( int type, String src){
+            int s = glCreateShader(type);
+            glShaderSource(s, src);
+            glCompileShader(s);
+            if (glGetShaderi(s, GL_COMPILE_STATUS) == GL_FALSE) {
+                throw new RuntimeException("Shader error:\n" + glGetShaderInfoLog(s));
+            }
+            return s;
+        }
+
+    static int makeProgram (String vertexSrc, String fragmentSrc){
+            int p = glCreateProgram();
+            glAttachShader(p, compile(GL_VERTEX_SHADER, vertexSrc));
+            glAttachShader(p, compile(GL_FRAGMENT_SHADER, fragmentSrc));
+            glLinkProgram(p);
+            if (glGetProgrami(p, GL_LINK_STATUS) == GL_FALSE) {
+                throw new RuntimeException("Link error:\n" + glGetProgramInfoLog(p));
+            }
+            return p;
+        }
+        static int loadTexture (String path){
+            try (MemoryStack stack = MemoryStack.stackPush()) {
+                IntBuffer w = stack.mallocInt(1), h = stack.mallocInt(1), n = stack.mallocInt(1);
+                ByteBuffer data = STBImage.stbi_load(path, w, h, n, 4);
+                if (data == null) {
+                    throw new RuntimeException("Could not load " + path + ": " + STBImage.stbi_failure_reason());
+                }
+
+                int tex = glGenTextures();
+                glBindTexture(GL_TEXTURE_2D, tex);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w.get(0), h.get(0), 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+                STBImage.stbi_image_free(data);
+                return tex;
+            }
+        }
+        static int[] makeTarget ( int w, int h){
+            int tex = glGenTextures();
+            glBindTexture(GL_TEXTURE_2D, tex);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, w, h, 0, GL_RGBA, GL_FLOAT, 0L);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+            int fbo = glGenFramebuffers();
+            glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+            if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+                throw new RuntimeException("Framebuffer is not complete");
+            }
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            return new int[]{fbo, tex};
+        }
+    static void freeTarget(int[] t) {
+        glDeleteFramebuffers(t[0]);
+        glDeleteTextures(t[1]);
+    }
+    }
