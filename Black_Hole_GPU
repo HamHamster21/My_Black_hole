@@ -336,7 +336,7 @@ public class Main {
         int uTilt = glGetUniformLocation(program, "uTilt");
         int uSkyGain = glGetUniformLocation(program, "uSkyGain");
 
-        int skyTex = loadTexture("C:/Users/temir/Pictures/stars.jpg");
+        int skyTex = loadTexture("C:/Users/User/Pictures/stars.jpg"); // what every picture you chose and change user to your folder
         int uSky = glGetUniformLocation(program, "uSky");
 
         while (!glfwWindowShouldClose(window)) {
